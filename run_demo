@@ -1,0 +1,3 @@
+cd platformio/Web_HelloWorld
+pio run -t upload && pio device monitor
+

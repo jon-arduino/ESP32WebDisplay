@@ -22,6 +22,33 @@ void WebTransport::begin() {
     if (!_mutex) _mutex = xSemaphoreCreateMutex();
     _txBuf.reserve(4096);
 
+
+    // add wifi re-try
+    WiFi.persistent(false);
+    WiFi.mode(_apSsid ? WIFI_AP_STA : WIFI_STA);
+    WiFi.setHostname(_hostname.c_str());      // after mode(): the STA interface exists now
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(_ssid, _password);
+    Serial.print("[Web] Connecting");
+    uint32_t t0 = millis(), lastTry = t0;
+    while (WiFi.status() != WL_CONNECTED) {
+        if (_apSsid && millis() - t0 >= _staTimeoutMs) {
+            Serial.println("\n[Web] STA timeout - starting SoftAP");
+            WiFi.disconnect(true);
+            startSoftAP();
+            break;
+        }
+        if (millis() - lastTry >= 10000) {     // retry: first attempt after a flash often fails
+            Serial.print("\n[Web] retrying");
+            WiFi.disconnect();
+            delay(100);
+            WiFi.begin(_ssid, _password);
+            lastTry = millis();
+        }
+        delay(500); Serial.print(".");
+    }
+    //
+    /*
     WiFi.mode(_apSsid ? WIFI_AP_STA : WIFI_STA);
     WiFi.setHostname(_hostname.c_str());
     WiFi.begin(_ssid, _password);
@@ -36,6 +63,7 @@ void WebTransport::begin() {
         }
         delay(500); Serial.print(".");
     }
+    */
     WiFi.setSleep(_powerSave);
     if (MDNS.begin(_hostname.c_str())) MDNS.addService("http", "tcp", _port);
     startServer();
