@@ -1,0 +1,7 @@
+test/node_modules/
+test/out/
+test/ref/gfx_ref
+test/ref/adafruit-gfx/
+.pio/
+.DS_Store
+.vscode/

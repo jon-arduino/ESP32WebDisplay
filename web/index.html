@@ -1,0 +1,847 @@
+<!doctype html>
+<!--
+  ESP32WebDisplay - browser renderer for ESP32PhoneDisplay wire-protocol streams.
+  Copyright (c) 2026 Jon Lotz. All rights reserved. (License terms pending.)
+
+  Portions of this file (the drawing algorithms and the classic 5x7 font table)
+  are ports of Adafruit_GFX and are used under its BSD license:
+
+    Software License Agreement (BSD License)
+
+    Copyright (c) 2012 Adafruit Industries.  All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+
+    - Redistributions of source code must retain the above copyright notice,
+      this list of conditions and the following disclaimer.
+    - Redistributions in binary form must reproduce the above copyright notice,
+      this list of conditions and the following disclaimer in the documentation
+      and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+    LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+    SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
+
+  Query parameters:
+    ?host=<ip[:port]>   ESP32 address (default: the host that served this page)
+    ?ws=<ws://...>      full WebSocket URL (overrides host/port/path)
+    ?port=<n>  ?path=/ws
+    ?flush=<ms>         idle auto-present delay when no FLUSH arrives (default 50)
+    ?buttons=0          hide the default T1/T2 buttons until the sketch adds some
+    ?debug              show live stats
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ESP32 Display</title>
+<style>
+  :root {
+    color-scheme: dark light;
+    --bg: #14161a; --panel: #1d2026; --line: #2c313a; --text: #e6e8eb; --dim: #8b929c;
+    --ok: #3ccf6e; --warn: #e8b23a; --bad: #e5534b; --accent: #4c8dff;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #eceef1; --panel: #ffffff; --line: #d5d9df; --text: #1b1e23; --dim: #646b75; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    background: var(--panel); border-bottom: 1px solid var(--line); min-height: 46px;
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--warn); flex: none; }
+  .dot.open { background: var(--ok); } .dot.closed { background: var(--bad); }
+  #title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #conn { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #spacer { flex: 1; }
+  #buttons { display: flex; gap: 8px; }
+  #buttons button {
+    font: inherit; font-weight: 600; min-width: 52px; padding: 6px 14px; cursor: pointer;
+    color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  }
+  #buttons button:hover { border-color: var(--accent); }
+  #buttons button:active { background: var(--accent); color: #fff; }
+  main { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; position: relative; }
+  canvas {
+    image-rendering: pixelated; background: #000; display: block;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+    box-shadow: 0 0 0 1px var(--line), 0 8px 30px rgba(0,0,0,.35);
+  }
+  #msg {
+    position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 12px; color: var(--dim); text-align: center; padding: 24px; pointer-events: none;
+  }
+  #msg form { pointer-events: auto; display: flex; gap: 8px; }
+  #msg input {
+    font: inherit; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--text); width: 220px;
+  }
+  #msg button {
+    font: inherit; padding: 6px 14px; border-radius: 8px; border: 0; background: var(--accent); color: #fff; cursor: pointer;
+  }
+  footer {
+    padding: 4px 12px; color: var(--dim); font-size: 12px; border-top: 1px solid var(--line);
+    background: var(--panel); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <span id="dot" class="dot"></span>
+  <span id="title">ESP32 Display</span>
+  <span id="conn"></span>
+  <span id="spacer"></span>
+  <div id="buttons"></div>
+</header>
+<main id="stage">
+  <canvas id="screen" width="240" height="320"></canvas>
+  <div id="msg" hidden></div>
+</main>
+<footer id="info"></footer>
+
+<script id="gfx-core">
+/* ===== GFX core: frame parser + Adafruit_GFX-compatible software renderer =====
+   DOM-free so it can be unit-tested in Node (see test/). */
+(function (root) {
+'use strict';
+
+// Classic 5x7 font from Adafruit_GFX glcdfont.c (256 glyphs x 5 columns).
+// Regenerate with tools/extract_font.py.
+// BEGIN FONT_HEX
+const FONT_HEX =
+  "00000000003e5b4f5b3e3e6b4f6b3e1c3e7c3e1c183c7e3c181c577d571c1c5e7f5e1c00183c1800ffe7c3e7ff0018241800" +
+  "ffe7dbe7ff30483a060e2629792926407f050507407f05253f5a3ce73c5a7f3e1c1c08081c1c3e7f14227f22145f5f005f5f" +
+  "06097f017f006689956a606060606094a2ffa29408047e040810207e201008082a1c08081c2a08081e101010100c1e0c1e0c" +
+  "30383e3830060e3e0e06000000000000005f00000007000700147f147f14242a7f2a12231308646236495620500008070300" +
+  "001c2241000041221c002a1c7f1c2a08083e080800807030000808080808000060600020100804023e5149453e00427f4000" +
+  "72494949462141494d331814127f1027454545393c4a49493141211109073649494936464949291e00001400000040340000" +
+  "00081422411414141414004122140802015909063e415d594e7c1211127c7f494949363e414141227f4141413e7f49494941" +
+  "7f090909013e414151737f0808087f00417f41002040413f017f081422417f404040407f021c027f7f0408107f3e4141413e" +
+  "7f090909063e4151215e7f09192946264949493203017f01033f4040403f1f2040201f3f4038403f63140814630304780403" +
+  "6159494d43007f4141410204081020004141417f04020102044040404040000307080020545478407f284444383844444428" +
+  "384444287f385454541800087e090218a4a49c787f0804047800447d40002040403d007f1028440000417f40007c04780478" +
+  "7c080404783844444438fc1824241818242418fc7c08040408485454542404043f44243c4040207c1c2040201c3c4030403c" +
+  "44281028444c9090907c4464544c4400083641000000770000004136080002010204023c2623263c1ea1a161123a4040207a" +
+  "385454555921555579412254547842215554784020545579400c1e5272123955555559395454545939555454580000457c41" +
+  "0002457d420001457c407d1211127df0282528f07c545545002054547c547c0a097f4932494949323a4444443a324a484830" +
+  "3a4141217a3a42402078009da0a07d3d4242423d3d4040403d3c24ff2424487e4943662b2ffc2f2bff0929f620c0887e0903" +
+  "20545479410000447d413048484a32384040227a007a0a0a727d0d19317d2629292f28262929292630484d40203808080808" +
+  "08080808382f10c8acba2f102834fa00007b000008142a142222142a14085500550055aa55aa55aaff55ff55ff000000ff00" +
+  "101010ff00141414ff001010ff00ff1010f010f0141414fc001414f700ff0000ff00ff1414f404fc141417101f10101f101f" +
+  "1414141f00101010f0000000001f101010101f10101010f010000000ff101010101010101010ff10000000ff140000ff00ff" +
+  "00001f10170000fc04f414141710171414f404f40000ff00f714141414141414f700f7141414171410101f101f141414f414" +
+  "1010f010f000001f101f0000001f14000000fc140000f010f01010ff10ff141414ff141010101f00000000f010ffffffffff" +
+  "f0f0f0f0f0ffffff0000000000ffff0f0f0f0f0f3844443844fc4a4a4a347e02020606027e027e0263554941633844443c04" +
+  "407e201e2006027e020299a5e7a5991c2a492a1c4c7201724c304a4d4d303048784830bc625a463d3e494949007e0101017e" +
+  "2a2a2a2a2a44445f444440514a444040444a51400000ff0103e080ff000008086b6b083612362436060f090f060000181800" +
+  "00001010003040ff0101001f01011e00191d1712003c3c3c3c0000000000";
+// END FONT_HEX
+const FONT = new Uint8Array(1280);
+for (let i = 0; i < 1280; i++) FONT[i] = parseInt(FONT_HEX.substr(i * 2, 2), 16);
+
+// ESP32 -> display opcodes (GraphicsProtocol.h / GFXProtocol.swift)
+const OP = {
+  BEGIN: 0x01, FILL_SCREEN: 0x02, FLUSH: 0x03, SET_ROTATION: 0x05, INVERT: 0x06,
+  CLOSE: 0x07, TITLE: 0x08, CLEAR_BUTTONS: 0x09, ADD_BUTTON: 0x0A,
+  PIXEL: 0x10, LINE: 0x11, HLINE: 0x12, VLINE: 0x13,
+  RECT: 0x20, FILL_RECT: 0x21, ROUNDRECT: 0x22, FILL_ROUNDRECT: 0x23,
+  CIRCLE: 0x30, FILL_CIRCLE: 0x31, TRI: 0x32, FILL_TRI: 0x33,
+  BITMAP: 0x40, BITMAP_BG: 0x41,
+  CURSOR: 0x50, TEXT_COLOR: 0x51, TEXT_COLOR_BG: 0x52, TEXT_SIZE: 0x53, TEXT_WRAP: 0x54,
+  CP437: 0x55, FONT: 0x56, WRITE_CHAR: 0x57, WRITE_UTF8: 0x58,
+  TOUCH_BEGIN: 0x70, TOUCH_END: 0x71, TOUCH_DELAY: 0x72, PING: 0xF0
+};
+// display -> ESP32 back-channel commands (Protocol.h)
+const BC = {
+  PONG: 0xF1, KEY1: 0xF2, KEY2: 0xF3, REDRAW: 0xE0, AVAILABLE: 0xE1,
+  TOUCH_DOWN: 0x10, TOUCH_MOVE: 0x11, TOUCH_UP: 0x12, Z_CONTACT: 128
+};
+
+const MAGIC = 0xA5;
+
+// Frame: [0xA5][lenLo][lenHi][cmd][payload...], len = 1 + payload bytes, all little-endian.
+function makeFrame(cmd, payload) {
+  const n = payload ? payload.length : 0;
+  const f = new Uint8Array(4 + n);
+  f[0] = MAGIC; f[1] = (n + 1) & 255; f[2] = (n + 1) >> 8; f[3] = cmd;
+  if (n) f.set(payload, 4);
+  return f;
+}
+
+const u16 = (p, o) => p[o] | (p[o + 1] << 8);
+const i16 = (p, o) => ((p[o] | (p[o + 1] << 8)) << 16) >> 16;
+const idiv = (a, b) => (a / b) | 0;          // C integer division (truncates toward zero)
+
+// RGB565 -> RGBA8888 exactly as the iPhone app does it: (v * 255) / max, integer division.
+const LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+function makeLut() {
+  const lut = new Uint32Array(65536);
+  for (let v = 0; v < 65536; v++) {
+    const r = Math.floor((((v >> 11) & 31) * 255) / 31);
+    const g = Math.floor((((v >> 5) & 63) * 255) / 63);
+    const b = Math.floor(((v & 31) * 255) / 31);
+    lut[v] = LITTLE_ENDIAN
+      ? ((0xFF000000 | (b << 16) | (g << 8) | r) >>> 0)
+      : (((r << 24) | (g << 16) | (b << 8) | 0xFF) >>> 0);
+  }
+  return lut;
+}
+
+// Byte-stream frame parser. WebSocket messages are NOT frame-aligned (a frame can
+// straddle two messages), so this keeps a rolling buffer exactly like a TCP reader.
+class FrameParser {
+  constructor(onFrame, maxLen) {
+    this.onFrame = onFrame;
+    this.maxLen = maxLen || 16384;
+    this.buf = new Uint8Array(8192);
+    this.start = 0; this.end = 0;
+    this.stats = { bytes: 0, frames: 0, syncErrors: 0, invalid: 0 };
+  }
+  reset() { this.start = this.end = 0; }
+  feed(data) {
+    this.stats.bytes += data.length;
+    if (this.end + data.length > this.buf.length) {
+      const live = this.end - this.start;
+      if (live + data.length > this.buf.length) {
+        const nb = new Uint8Array(Math.max(this.buf.length * 2, live + data.length));
+        nb.set(this.buf.subarray(this.start, this.end));
+        this.buf = nb;
+      } else {
+        this.buf.copyWithin(0, this.start, this.end);
+      }
+      this.start = 0; this.end = live;
+    }
+    this.buf.set(data, this.end);
+    this.end += data.length;
+    this._drain();
+  }
+  _drain() {
+    const b = this.buf;
+    while (this.end - this.start >= 3) {
+      if (b[this.start] !== MAGIC) { this.start++; this.stats.syncErrors++; continue; }
+      const len = b[this.start + 1] | (b[this.start + 2] << 8);
+      if (len < 1 || len > this.maxLen) { this.start++; this.stats.invalid++; continue; }
+      if (this.end - this.start < 3 + len) break;          // wait for the rest
+      const cmd = b[this.start + 3];
+      const payload = b.subarray(this.start + 4, this.start + 3 + len);
+      this.start += 3 + len;
+      this.stats.frames++;
+      this.onFrame(cmd, payload);
+    }
+    if (this.start === this.end) this.start = this.end = 0;
+  }
+}
+
+const MAX_PIXELS = 1 << 20;
+
+class Renderer {
+  // handlers: optional callbacks - begin, layout, flush, title, clearButtons, addButton,
+  // touchBegin(mode,intervalMs), touchEnd, touchDelay(intervalMs), ping, close
+  constructor(handlers) {
+    this.hd = handlers || {};
+    this.lut = null;
+    this.stats = { bad: 0, unknown: 0 };
+    this.W = this.H = this.w = this.h = 0;
+    this.fb = new Uint16Array(0); this.snap = new Uint16Array(0);
+    this.hasSnap = false; this.dirty = false;
+    this.warnedFont = false;
+    this._resetState();
+  }
+  _emit(name, a, b) { const f = this.hd[name]; if (f) f(a, b); }
+
+  _resetState() {
+    this.rot = 0; this.inv = 0;
+    this.cx = 0; this.cy = 0;
+    this.tsx = 1; this.tsy = 1;
+    this.fg = 0xFFFF; this.bg = 0xFFFF;
+    this.wrap = true; this.cp437 = false;
+  }
+  _layout() {
+    const odd = this.rot & 1;
+    this.w = odd ? this.H : this.W;     // logical (rotated) size, like Adafruit's _width/_height
+    this.h = odd ? this.W : this.H;
+  }
+  get lw() { return this.w; }
+  get lh() { return this.h; }
+
+  // BEGIN = full reset: allocate surface, clear to black, reset all drawing state.
+  begin(w, h) {
+    if (w < 1 || h < 1 || w * h > MAX_PIXELS) { this.stats.bad++; return; }
+    this.W = w; this.H = h;
+    this.fb = new Uint16Array(w * h);
+    this.snap = new Uint16Array(w * h);
+    this.hasSnap = false;
+    this._resetState();
+    this._layout();
+    this.dirty = true;
+    this._emit('begin', w, h);
+    this._emit('layout');
+  }
+
+  // Freeze the current framebuffer as the frame to present (called on FLUSH / idle gap).
+  snapshot() {
+    if (!this.fb.length) return;
+    this.snap.set(this.fb);
+    this.sW = this.W; this.sH = this.H; this.sRot = this.rot; this.sInv = this.inv;
+    this.hasSnap = true; this.dirty = false;
+  }
+  snapSize() {
+    const odd = this.sRot & 1;
+    return { w: odd ? this.sH : this.sW, h: odd ? this.sW : this.sH };
+  }
+  // Convert the snapshot to RGBA (logical orientation) into a Uint32Array of w*h pixels.
+  presentSnapshot(out) {
+    if (!this.hasSnap) return;
+    if (!this.lut) this.lut = makeLut();
+    const lut = this.lut, s = this.snap, W = this.sW, H = this.sH;
+    const mask = this.sInv ? 0xFFFF : 0;
+    const { w, h } = this.snapSize();
+    let o = 0;
+    switch (this.sRot) {
+      case 0:
+        for (let i = 0, n = w * h; i < n; i++) out[i] = lut[s[i] ^ mask];
+        break;
+      case 1:
+        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) out[o++] = lut[s[x * W + (W - 1 - y)] ^ mask];
+        break;
+      case 2:
+        for (let i = 0, n = w * h; i < n; i++) out[i] = lut[s[n - 1 - i] ^ mask];
+        break;
+      default:
+        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) out[o++] = lut[s[(H - 1 - x) * W + y] ^ mask];
+    }
+  }
+
+  // ---- command dispatch --------------------------------------------------------
+  exec(cmd, p) {
+    const n = p.length;
+    const need = (k) => { if (n >= k) return true; this.stats.bad++; return false; };
+    switch (cmd) {
+      case OP.BEGIN: if (need(4)) this.begin(u16(p, 0), u16(p, 2)); break;
+      case OP.FILL_SCREEN: if (need(2)) { this.fb.fill(u16(p, 0)); this.dirty = true; } break;
+      case OP.FLUSH: this.snapshot(); this._emit('flush'); break;
+      case OP.SET_ROTATION: if (need(1)) { this.rot = p[0] & 3; this._layout(); this.dirty = true; this._emit('layout'); } break;
+      case OP.INVERT: if (need(1)) { this.inv = p[0] ? 1 : 0; this.dirty = true; } break;
+      case OP.CLOSE: this.fb.fill(0); this.dirty = true; this.snapshot(); this._emit('close'); this._emit('flush'); break;
+      case OP.TITLE: this._emit('title', new TextDecoder('utf-8').decode(p)); break;
+      case OP.CLEAR_BUTTONS: this._emit('clearButtons'); break;
+      case OP.ADD_BUTTON:
+        if (need(2) && need(2 + p[1])) this._emit('addButton', p[0], new TextDecoder('utf-8').decode(p.subarray(2, 2 + p[1])));
+        break;
+
+      case OP.PIXEL: if (need(6)) this.px(i16(p, 0), i16(p, 2), u16(p, 4)); break;
+      case OP.LINE: if (need(10)) this.drawLine(i16(p, 0), i16(p, 2), i16(p, 4), i16(p, 6), u16(p, 8)); break;
+      case OP.HLINE: if (need(8)) this.hline(i16(p, 0), i16(p, 2), i16(p, 4), u16(p, 6)); break;
+      case OP.VLINE: if (need(8)) this.vline(i16(p, 0), i16(p, 2), i16(p, 4), u16(p, 6)); break;
+      case OP.RECT: if (need(10)) this.drawRect(i16(p, 0), i16(p, 2), i16(p, 4), i16(p, 6), u16(p, 8)); break;
+      case OP.FILL_RECT: if (need(10)) this.fillRect(i16(p, 0), i16(p, 2), i16(p, 4), i16(p, 6), u16(p, 8)); break;
+      case OP.ROUNDRECT: if (need(12)) this.drawRoundRect(i16(p, 0), i16(p, 2), i16(p, 4), i16(p, 6), i16(p, 8), u16(p, 10)); break;
+      case OP.FILL_ROUNDRECT: if (need(12)) this.fillRoundRect(i16(p, 0), i16(p, 2), i16(p, 4), i16(p, 6), i16(p, 8), u16(p, 10)); break;
+      case OP.CIRCLE: if (need(8)) this.drawCircle(i16(p, 0), i16(p, 2), i16(p, 4), u16(p, 6)); break;
+      case OP.FILL_CIRCLE: if (need(8)) this.fillCircle(i16(p, 0), i16(p, 2), i16(p, 4), u16(p, 6)); break;
+      case OP.TRI: if (need(14)) this.drawTriangle(i16(p, 0), i16(p, 2), i16(p, 4), i16(p, 6), i16(p, 8), i16(p, 10), u16(p, 12)); break;
+      case OP.FILL_TRI: if (need(14)) this.fillTriangle(i16(p, 0), i16(p, 2), i16(p, 4), i16(p, 6), i16(p, 8), i16(p, 10), u16(p, 12)); break;
+
+      // NOTE: the wire format has no colour for DRAW_BITMAP, so the current text colour is used.
+      case OP.BITMAP: if (need(8)) this.drawBitmap(i16(p, 0), i16(p, 2), i16(p, 4), i16(p, 6), p.subarray(8), this.fg, -1); break;
+      case OP.BITMAP_BG: if (need(12)) this.drawBitmap(i16(p, 0), i16(p, 2), i16(p, 4), i16(p, 6), p.subarray(12), u16(p, 8), u16(p, 10)); break;
+
+      case OP.CURSOR: if (need(4)) { this.cx = i16(p, 0); this.cy = i16(p, 2); } break;
+      case OP.TEXT_COLOR: if (need(2)) this.fg = this.bg = u16(p, 0); break;     // Adafruit: setTextColor(c) sets both
+      case OP.TEXT_COLOR_BG: if (need(4)) { this.fg = u16(p, 0); this.bg = u16(p, 2); } break;
+      case OP.TEXT_SIZE: if (need(1)) this.tsx = this.tsy = p[0] > 0 ? p[0] : 1; break;
+      case OP.TEXT_WRAP: if (need(1)) this.wrap = !!p[0]; break;
+      case OP.CP437: if (need(1)) this.cp437 = !!p[0]; break;
+      case OP.FONT:
+        // Custom GFXfonts are not supported yet; text keeps using the classic 5x7 font.
+        if (need(2) && u16(p, 0) !== 0 && !this.warnedFont) { this.warnedFont = true; console.warn('custom fonts not supported yet'); }
+        break;
+      case OP.WRITE_CHAR: if (need(1)) this.writeChar(p[0]); break;
+      case OP.WRITE_UTF8:
+        if (need(2) && need(2 + u16(p, 0))) {
+          const len = u16(p, 0);
+          for (let i = 0; i < len; i++) this.writeChar(p[2 + i] < 0x80 ? p[2 + i] : 0x3F);   // ASCII only for now
+        }
+        break;
+
+      case OP.TOUCH_BEGIN: this._emit('touchBegin', n >= 1 ? p[0] : 0, n >= 3 ? u16(p, 1) : 50); break;
+      case OP.TOUCH_END: this._emit('touchEnd'); break;
+      case OP.TOUCH_DELAY: if (need(2)) this._emit('touchDelay', u16(p, 0)); break;
+      case OP.PING: this._emit('ping'); break;
+      default: this.stats.unknown++;
+    }
+  }
+
+  // ---- drawing primitives: ports of Adafruit_GFX over a GFXcanvas16-style surface ----
+  // px = GFXcanvas16::drawPixel (clip to the rotated size, then map to the raw buffer)
+  px(x, y, c) {
+    if (x < 0 || y < 0 || x >= this.w || y >= this.h) return;
+    let X = x, Y = y;
+    switch (this.rot) {
+      case 1: X = this.W - 1 - y; Y = x; break;
+      case 2: X = this.W - 1 - x; Y = this.H - 1 - y; break;
+      case 3: X = y; Y = this.H - 1 - x; break;
+    }
+    this.fb[X + Y * this.W] = c;
+    this.dirty = true;
+  }
+  _rawV(x, y, h, c) { const W = this.W, fb = this.fb; for (let i = y * W + x, k = 0; k < h; k++, i += W) fb[i] = c; this.dirty = true; }
+  _rawH(x, y, w, c) { const i = y * this.W + x; this.fb.fill(c, i, i + w); this.dirty = true; }
+
+  // GFXcanvas16::drawFastVLine / drawFastHLine (negative lengths extend the other way)
+  vline(x, y, h, c) {
+    if (h < 0) { h = -h; y -= h - 1; if (y < 0) { h += y; y = 0; } }
+    if (x < 0 || x >= this.w || y >= this.h || (y + h - 1) < 0) return;
+    if (y < 0) { h += y; y = 0; }
+    if (y + h > this.h) h = this.h - y;
+    const W = this.W, H = this.H;
+    switch (this.rot) {
+      case 0: this._rawV(x, y, h, c); break;
+      case 1: { const t = x; x = W - 1 - y; y = t; x -= h - 1; this._rawH(x, y, h, c); break; }
+      case 2: x = W - 1 - x; y = H - 1 - y; y -= h - 1; this._rawV(x, y, h, c); break;
+      case 3: { const t = x; x = y; y = H - 1 - t; this._rawH(x, y, h, c); break; }
+    }
+  }
+  hline(x, y, w, c) {
+    if (w < 0) { w = -w; x -= w - 1; if (x < 0) { w += x; x = 0; } }
+    if (y < 0 || y >= this.h || x >= this.w || (x + w - 1) < 0) return;
+    if (x < 0) { w += x; x = 0; }
+    if (x + w >= this.w) w = this.w - x;
+    const W = this.W, H = this.H;
+    switch (this.rot) {
+      case 0: this._rawH(x, y, w, c); break;
+      case 1: { const t = x; x = W - 1 - y; y = t; this._rawV(x, y, w, c); break; }
+      case 2: x = W - 1 - x; y = H - 1 - y; x -= w - 1; this._rawH(x, y, w, c); break;
+      case 3: { const t = x; x = y; y = H - 1 - t; y -= w - 1; this._rawV(x, y, w, c); break; }
+    }
+  }
+
+  // Adafruit_GFX::writeLine (Bresenham)
+  writeLine(x0, y0, x1, y1, c) {
+    const steep = Math.abs(y1 - y0) > Math.abs(x1 - x0);
+    let t;
+    if (steep) { t = x0; x0 = y0; y0 = t; t = x1; x1 = y1; y1 = t; }
+    if (x0 > x1) { t = x0; x0 = x1; x1 = t; t = y0; y0 = y1; y1 = t; }
+    const dx = x1 - x0, dy = Math.abs(y1 - y0);
+    let err = idiv(dx, 2);
+    const ystep = y0 < y1 ? 1 : -1;
+    for (; x0 <= x1; x0++) {
+      if (steep) this.px(y0, x0, c); else this.px(x0, y0, c);
+      err -= dy;
+      if (err < 0) { y0 += ystep; err += dx; }
+    }
+  }
+  drawLine(x0, y0, x1, y1, c) {
+    let t;
+    if (x0 === x1) { if (y0 > y1) { t = y0; y0 = y1; y1 = t; } this.vline(x0, y0, y1 - y0 + 1, c); }
+    else if (y0 === y1) { if (x0 > x1) { t = x0; x0 = x1; x1 = t; } this.hline(x0, y0, x1 - x0 + 1, c); }
+    else this.writeLine(x0, y0, x1, y1, c);
+  }
+  fillRect(x, y, w, h, c) { for (let i = x; i < x + w; i++) this.vline(i, y, h, c); }
+  drawRect(x, y, w, h, c) {
+    this.hline(x, y, w, c); this.hline(x, y + h - 1, w, c);
+    this.vline(x, y, h, c); this.vline(x + w - 1, y, h, c);
+  }
+
+  drawCircle(x0, y0, r, c) {
+    let f = 1 - r, ddx = 1, ddy = -2 * r, x = 0, y = r;
+    this.px(x0, y0 + r, c); this.px(x0, y0 - r, c); this.px(x0 + r, y0, c); this.px(x0 - r, y0, c);
+    while (x < y) {
+      if (f >= 0) { y--; ddy += 2; f += ddy; }
+      x++; ddx += 2; f += ddx;
+      this.px(x0 + x, y0 + y, c); this.px(x0 - x, y0 + y, c);
+      this.px(x0 + x, y0 - y, c); this.px(x0 - x, y0 - y, c);
+      this.px(x0 + y, y0 + x, c); this.px(x0 - y, y0 + x, c);
+      this.px(x0 + y, y0 - x, c); this.px(x0 - y, y0 - x, c);
+    }
+  }
+  drawCircleHelper(x0, y0, r, corner, c) {
+    let f = 1 - r, ddx = 1, ddy = -2 * r, x = 0, y = r;
+    while (x < y) {
+      if (f >= 0) { y--; ddy += 2; f += ddy; }
+      x++; ddx += 2; f += ddx;
+      if (corner & 0x4) { this.px(x0 + x, y0 + y, c); this.px(x0 + y, y0 + x, c); }
+      if (corner & 0x2) { this.px(x0 + x, y0 - y, c); this.px(x0 + y, y0 - x, c); }
+      if (corner & 0x8) { this.px(x0 - y, y0 + x, c); this.px(x0 - x, y0 + y, c); }
+      if (corner & 0x1) { this.px(x0 - y, y0 - x, c); this.px(x0 - x, y0 - y, c); }
+    }
+  }
+  fillCircle(x0, y0, r, c) {
+    this.vline(x0, y0 - r, 2 * r + 1, c);
+    this.fillCircleHelper(x0, y0, r, 3, 0, c);
+  }
+  fillCircleHelper(x0, y0, r, corners, delta, c) {
+    let f = 1 - r, ddx = 1, ddy = -2 * r, x = 0, y = r, px = x, py = y;
+    delta++;
+    while (x < y) {
+      if (f >= 0) { y--; ddy += 2; f += ddy; }
+      x++; ddx += 2; f += ddx;
+      if (x < (y + 1)) {
+        if (corners & 1) this.vline(x0 + x, y0 - y, 2 * y + delta, c);
+        if (corners & 2) this.vline(x0 - x, y0 - y, 2 * y + delta, c);
+      }
+      if (y !== py) {
+        if (corners & 1) this.vline(x0 + py, y0 - px, 2 * px + delta, c);
+        if (corners & 2) this.vline(x0 - py, y0 - px, 2 * px + delta, c);
+        py = y;
+      }
+      px = x;
+    }
+  }
+  drawRoundRect(x, y, w, h, r, c) {
+    const maxr = idiv(w < h ? w : h, 2);
+    if (r > maxr) r = maxr;
+    this.hline(x + r, y, w - 2 * r, c);
+    this.hline(x + r, y + h - 1, w - 2 * r, c);
+    this.vline(x, y + r, h - 2 * r, c);
+    this.vline(x + w - 1, y + r, h - 2 * r, c);
+    this.drawCircleHelper(x + r, y + r, r, 1, c);
+    this.drawCircleHelper(x + w - r - 1, y + r, r, 2, c);
+    this.drawCircleHelper(x + w - r - 1, y + h - r - 1, r, 4, c);
+    this.drawCircleHelper(x + r, y + h - r - 1, r, 8, c);
+  }
+  fillRoundRect(x, y, w, h, r, c) {
+    const maxr = idiv(w < h ? w : h, 2);
+    if (r > maxr) r = maxr;
+    this.fillRect(x + r, y, w - 2 * r, h, c);
+    this.fillCircleHelper(x + w - r - 1, y + r, r, 1, h - 2 * r - 1, c);
+    this.fillCircleHelper(x + r, y + r, r, 2, h - 2 * r - 1, c);
+  }
+  drawTriangle(x0, y0, x1, y1, x2, y2, c) {
+    this.drawLine(x0, y0, x1, y1, c); this.drawLine(x1, y1, x2, y2, c); this.drawLine(x2, y2, x0, y0, c);
+  }
+  fillTriangle(x0, y0, x1, y1, x2, y2, c) {
+    let a, b, y, last, t;
+    if (y0 > y1) { t = y0; y0 = y1; y1 = t; t = x0; x0 = x1; x1 = t; }
+    if (y1 > y2) { t = y2; y2 = y1; y1 = t; t = x2; x2 = x1; x1 = t; }
+    if (y0 > y1) { t = y0; y0 = y1; y1 = t; t = x0; x0 = x1; x1 = t; }
+    if (y0 === y2) {
+      a = b = x0;
+      if (x1 < a) a = x1; else if (x1 > b) b = x1;
+      if (x2 < a) a = x2; else if (x2 > b) b = x2;
+      this.hline(a, y0, b - a + 1, c);
+      return;
+    }
+    const dx01 = x1 - x0, dy01 = y1 - y0, dx02 = x2 - x0, dy02 = y2 - y0, dx12 = x2 - x1, dy12 = y2 - y1;
+    let sa = 0, sb = 0;
+    last = (y1 === y2) ? y1 : y1 - 1;
+    for (y = y0; y <= last; y++) {
+      a = x0 + idiv(sa, dy01); b = x0 + idiv(sb, dy02);
+      sa += dx01; sb += dx02;
+      if (a > b) { t = a; a = b; b = t; }
+      this.hline(a, y, b - a + 1, c);
+    }
+    sa = dx12 * (y - y1); sb = dx02 * (y - y0);
+    for (; y <= y2; y++) {
+      a = x1 + idiv(sa, dy12); b = x0 + idiv(sb, dy02);
+      sa += dx12; sb += dx02;
+      if (a > b) { t = a; a = b; b = t; }
+      this.hline(a, y, b - a + 1, c);
+    }
+  }
+
+  // 1-bit bitmap, rows padded to whole bytes, MSB first (Adafruit drawBitmap). bg < 0 = transparent.
+  drawBitmap(x, y, w, h, data, color, bg) {
+    const bw = (w + 7) >> 3;
+    let b = 0;
+    for (let j = 0; j < h; j++, y++) {
+      for (let i = 0; i < w; i++) {
+        if (i & 7) b <<= 1;
+        else { const k = j * bw + (i >> 3); b = k < data.length ? data[k] : 0; }
+        if (b & 0x80) this.px(x + i, y, color);
+        else if (bg >= 0) this.px(x + i, y, bg);
+      }
+    }
+  }
+
+  // ---- text: Adafruit_GFX classic font ------------------------------------------
+  drawChar(x, y, c, color, bg, sx, sy) {
+    if (x >= this.w || y >= this.h || (x + 6 * sx - 1) < 0 || (y + 8 * sy - 1) < 0) return;
+    if (!this.cp437 && c >= 176) c = (c + 1) & 255;            // 'classic' charset quirk (unsigned char wraps)
+    let rp = 0, rb = 0;
+    for (let i = 0; i < 5; i++, rp = 0, rb = 0) {
+      let line = FONT[c * 5 + i];
+      for (let j = 0; j < 8; j++, line >>= 1) {
+        if (line & 1) {
+          rp++;
+          if (!(1 & (line >> 1)) || j === 7) {
+            if (rp === 1 && sx === 1 && sy === 1) this.px(x + i, y + j, color);
+            else if (rp > 0) this.fillRect(x + i * sx, y + (j - (rp - 1)) * sy, sx, sy * rp, color);
+            rp = 0;
+          }
+        } else if (bg !== color) {
+          rb++;
+          if ((1 & (line >> 1)) || j === 7) {
+            if (rb === 1 && sx === 1 && sy === 1) this.px(x + i, y + j, bg);
+            else if (rb > 0) this.fillRect(x + i * sx, y + (j - (rb - 1)) * sy, sx, sy * rb, bg);
+            rb = 0;
+          }
+        }
+      }
+    }
+    if (bg !== color) {
+      if (sx === 1 && sy === 1) this.vline(x + 5, y, 8, bg);
+      else this.fillRect(x + 5 * sx, y, sx, 8 * sy, bg);
+    }
+  }
+  writeChar(c) {
+    if (c === 10) { this.cx = 0; this.cy += this.tsy * 8; }
+    else if (c !== 13) {
+      if (this.wrap && (this.cx + this.tsx * 6) > this.w) { this.cx = 0; this.cy += this.tsy * 8; }
+      this.drawChar(this.cx, this.cy, c, this.fg, this.bg, this.tsx, this.tsy);
+      this.cx += this.tsx * 6;
+    }
+  }
+}
+
+const api = { OP, BC, FrameParser, Renderer, makeFrame, makeLut, FONT };
+if (typeof module !== 'undefined' && module.exports) module.exports = api;
+else root.GfxCore = api;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<script id="app">
+(function () {
+'use strict';
+const { OP, BC, FrameParser, Renderer, makeFrame } = window.GfxCore;
+const $ = (id) => document.getElementById(id);
+const q = new URLSearchParams(location.search);
+const num = (v, d, lo, hi) => { const n = parseInt(v, 10); return isNaN(n) ? d : Math.min(hi, Math.max(lo, n)); };
+const cfg = {
+  flushIdleMs: num(q.get('flush'), 50, 0, 5000),   // present after this long with no FLUSH
+  debug: q.has('debug'),
+  defaultButtons: q.get('buttons') !== '0'
+};
+
+const canvas = $('screen'), ctx = canvas.getContext('2d'), stage = $('stage');
+let img = null, out32 = null, lw = 0, lh = 0;
+let rafId = 0, idleTimer = 0, frames = 0;
+
+// ---- rendering ------------------------------------------------------------------
+function fit() {
+  if (!lw) return;
+  const r = stage.getBoundingClientRect();
+  const aw = Math.max(1, r.width - 24), ah = Math.max(1, r.height - 24);
+  let s = Math.min(aw / lw, ah / lh);
+  if (s >= 1) s = Math.floor(s);
+  canvas.style.width = Math.round(lw * s) + 'px';
+  canvas.style.height = Math.round(lh * s) + 'px';
+}
+function ensureSurface(w, h) {
+  if (w === lw && h === lh) return;
+  lw = w; lh = h;
+  canvas.width = w; canvas.height = h;
+  img = ctx.createImageData(w, h);
+  out32 = new Uint32Array(img.data.buffer);
+  fit();
+}
+function doPresent() {
+  rafId = 0;
+  if (!renderer.hasSnap) return;
+  const s = renderer.snapSize();
+  ensureSurface(s.w, s.h);
+  renderer.presentSnapshot(out32);
+  ctx.putImageData(img, 0, 0);
+  frames++;
+  $('msg').hidden = true;
+}
+function schedulePresent() { if (!rafId) rafId = requestAnimationFrame(doPresent); }
+
+// ---- session state: title, buttons, touch ----------------------------------------
+const buttons = { 0xF2: cfg.defaultButtons ? 'T1' : null, 0xF3: cfg.defaultButtons ? 'T2' : null };
+function renderButtons() {
+  const box = $('buttons');
+  box.textContent = '';
+  for (const key of [0xF2, 0xF3]) {                // KEY1 always renders left of KEY2
+    if (buttons[key] == null) continue;
+    const b = document.createElement('button');
+    b.type = 'button'; b.textContent = buttons[key] || (key === 0xF2 ? 'T1' : 'T2');
+    b.title = 'Key ' + (key === 0xF2 ? '1' : '2') + ' (keyboard: ' + (key === 0xF2 ? '1' : '2') + ')';
+    b.addEventListener('click', () => send(makeFrame(key)));
+    box.appendChild(b);
+  }
+}
+const touch = { on: false, mode: 0, interval: 50, id: null, last: 0, pending: null, trail: 0 };
+
+const renderer = new Renderer({
+  layout() { fit(); },
+  flush() { schedulePresent(); },
+  close() { $('msg').textContent = 'Display closed by the ESP32'; $('msg').hidden = false; },
+  title(t) { $('title').textContent = t || 'ESP32 Display'; document.title = t || 'ESP32 Display'; },
+  clearButtons() { buttons[0xF2] = buttons[0xF3] = null; renderButtons(); },
+  addButton(key, label) { if (key === 0xF2 || key === 0xF3) { buttons[key] = label; renderButtons(); } },
+  touchBegin(mode, interval) { touch.on = true; touch.mode = mode; touch.interval = interval; },
+  touchEnd() { touch.on = false; cancelTouch(); },
+  touchDelay(ms) { touch.interval = ms; },
+  ping() { send(makeFrame(BC.PONG)); }
+});
+const parser = new FrameParser((cmd, p) => renderer.exec(cmd, p));
+
+// ---- WebSocket ------------------------------------------------------------------
+let ws = null, retryMs = 500, retryTimer = 0;
+function resolveUrl() {
+  const full = q.get('ws');
+  if (full) return full;
+  let host = q.get('host');
+  if (!host && location.protocol.indexOf('http') === 0) host = location.host;
+  if (!host) { try { host = localStorage.getItem('esp32wd.host'); } catch (e) {} }
+  if (!host) return null;
+  if (!/:\d+$/.test(host) && q.get('port')) host += ':' + q.get('port');
+  return 'ws://' + host + (q.get('path') || '/ws');
+}
+function setStatus(kind, text) {
+  $('dot').className = 'dot ' + kind;
+  $('conn').textContent = text;
+}
+function send(frame) { if (ws && ws.readyState === 1) ws.send(frame); }
+
+function showPrompt() {
+  const m = $('msg');
+  m.hidden = false;
+  m.textContent = '';
+  const t = document.createElement('div');
+  t.textContent = 'Enter the ESP32 address (IP or hostname)';
+  const f = document.createElement('form');
+  const i = document.createElement('input');
+  i.placeholder = 'esp32-display.local'; i.autofocus = true;
+  const b = document.createElement('button'); b.textContent = 'Connect';
+  f.append(i, b);
+  f.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const v = i.value.trim(); if (!v) return;
+    try { localStorage.setItem('esp32wd.host', v); } catch (err) {}
+    m.hidden = true; connect();
+  });
+  m.append(t, f);
+  setStatus('closed', 'Not configured');
+}
+function connect() {
+  clearTimeout(retryTimer);
+  const url = resolveUrl();
+  if (!url) { showPrompt(); return; }
+  setStatus('', 'Connecting to ' + url.replace(/^ws:\/\//, '') + '...');
+  try { ws = new WebSocket(url); } catch (e) { scheduleRetry(); return; }
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    retryMs = 500; parser.reset(); touch.on = false; cancelTouch();
+    setStatus('open', 'Connected');
+    if (!renderer.hasSnap) { $('msg').textContent = 'Connected - waiting for the sketch to draw...'; $('msg').hidden = false; }
+    setTimeout(() => announce(!document.hidden), 100);          // protocol: ~100 ms after connect
+  };
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === 'string') return;
+    parser.feed(new Uint8Array(ev.data));
+    if (renderer.dirty) {                                        // no FLUSH yet: auto-present after an idle gap
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => { renderer.snapshot(); schedulePresent(); }, cfg.flushIdleMs);
+    }
+  };
+  ws.onclose = () => { setStatus('closed', 'Disconnected - retrying...'); cancelTouch(); touch.on = false; scheduleRetry(); };
+  ws.onerror = () => {};
+}
+function scheduleRetry() {
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(connect, retryMs);
+  retryMs = Math.min(retryMs * 2, 4000);
+}
+function announce(avail) { send(makeFrame(BC.AVAILABLE, [avail ? 1 : 0])); }
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) announce(false);
+  else { announce(true); send(makeFrame(BC.REDRAW)); }
+});
+
+// ---- touch (Pointer Events) ------------------------------------------------------
+function mapPoint(e) {
+  const r = canvas.getBoundingClientRect();
+  if (!r.width || !r.height || !lw) return null;
+  const x = Math.floor((e.clientX - r.left) * lw / r.width);
+  const y = Math.floor((e.clientY - r.top) * lh / r.height);
+  return { x: Math.min(lw - 1, Math.max(0, x)), y: Math.min(lh - 1, Math.max(0, y)),
+           inside: e.clientX >= r.left && e.clientX < r.right && e.clientY >= r.top && e.clientY < r.bottom };
+}
+function sendTouch(cmd, pt) {
+  const p = new Uint8Array([pt.x & 255, pt.x >> 8, pt.y & 255, pt.y >> 8, BC.Z_CONTACT]);
+  send(makeFrame(cmd, p));
+}
+function cancelTouch() { clearTimeout(touch.trail); touch.trail = 0; touch.pending = null; touch.id = null; }
+function flushPending() {
+  clearTimeout(touch.trail); touch.trail = 0;
+  if (touch.pending) { sendTouch(BC.TOUCH_MOVE, touch.pending); touch.pending = null; touch.last = performance.now(); }
+}
+canvas.addEventListener('pointerdown', (e) => {
+  if (!touch.on || touch.id !== null) return;
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  const pt = mapPoint(e); if (!pt || !pt.inside) return;
+  touch.id = e.pointerId;
+  try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+  sendTouch(BC.TOUCH_DOWN, pt);
+  touch.last = performance.now(); touch.pending = null;
+  e.preventDefault();
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (!touch.on || e.pointerId !== touch.id) return;
+  const pt = mapPoint(e); if (!pt) return;
+  const now = performance.now(), wait = touch.interval - (now - touch.last);
+  if (touch.interval === 0 || wait <= 0) { touch.pending = null; sendTouch(BC.TOUCH_MOVE, pt); touch.last = now; }
+  else {
+    touch.pending = pt;                                          // throttled: deliver the latest position later
+    if (!touch.trail) touch.trail = setTimeout(flushPending, wait);
+  }
+  e.preventDefault();
+});
+function endTouch(e) {
+  if (e.pointerId !== touch.id) return;
+  flushPending();
+  touch.id = null;
+  send(makeFrame(BC.TOUCH_UP));
+}
+canvas.addEventListener('pointerup', endTouch);
+canvas.addEventListener('pointercancel', endTouch);
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+// ---- keyboard shortcuts: 1 / 2 = T1 / T2 -----------------------------------------
+document.addEventListener('keydown', (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+  if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+  const key = e.key === '1' ? 0xF2 : e.key === '2' ? 0xF3 : 0;
+  if (key && buttons[key] != null) send(makeFrame(key));
+});
+
+// ---- footer info ------------------------------------------------------------------
+let lastBytes = 0, lastFrames = 0, lastT = performance.now();
+setInterval(() => {
+  const now = performance.now(), dt = (now - lastT) / 1000;
+  let s = lw ? lw + '×' + lh + ' · rotation ' + renderer.rot * 90 + '°' : 'no display yet';
+  if (cfg.debug) {
+    const st = parser.stats;
+    s += ' · ' + ((frames - lastFrames) / dt).toFixed(0) + ' fps · ' + ((st.bytes - lastBytes) / dt / 1024).toFixed(1) +
+         ' KB/s · cmds ' + st.frames + ' · sync ' + st.syncErrors + ' bad ' + (st.invalid + renderer.stats.bad) +
+         ' unknown ' + renderer.stats.unknown;
+  }
+  $('info').textContent = s;
+  lastBytes = parser.stats.bytes; lastFrames = frames; lastT = now;
+}, 500);
+
+window.addEventListener('resize', fit);
+renderButtons();
+connect();
+})();
+</script>
+</body>
+</html>

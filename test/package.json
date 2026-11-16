@@ -1,0 +1,6 @@
+{
+  "name": "esp32webdisplay-tests",
+  "private": true,
+  "description": "Test-only dependencies (not part of the Arduino library)",
+  "devDependencies": { "jsdom": "^26.0.0" }
+}
