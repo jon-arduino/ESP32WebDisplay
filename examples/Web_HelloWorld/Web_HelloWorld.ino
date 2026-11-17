@@ -2,8 +2,8 @@
 // (or http://esp32-display.local/). Touch paints dots; T1 clears; T2 redraws.
 #include <ESP32WebDisplay.h>
 
-const char *WIFI_SSID = "your-ssid";
-const char *WIFI_PASS = "your-password";
+const char *WIFI_SSID = "YOUR_SSID";
+const char *WIFI_PASS = "YOUR_PASSWORD";
 
 WebTransport      transport(WIFI_SSID, WIFI_PASS, "esp32-display");
 ESP32PhoneDisplay display(transport);

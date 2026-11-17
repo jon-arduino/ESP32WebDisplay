@@ -69,7 +69,8 @@ private:
     AsyncWebServer _server;
     AsyncWebSocket _ws;
     BackChannelParser _parser;
-    SemaphoreHandle_t _mutex = nullptr;
+    SemaphoreHandle_t _mutex = nullptr;       // protects _txBuf
+    SemaphoreHandle_t _sendMutex = nullptr;   // serialises drain(): swap + send must be atomic or chunks reorder
     std::vector<uint8_t> _txBuf;
     volatile bool     _connected = false;
     volatile uint32_t _clientId  = 0;

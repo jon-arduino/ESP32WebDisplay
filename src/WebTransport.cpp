@@ -20,10 +20,9 @@ void WebTransport::startSoftAP() {
 
 void WebTransport::begin() {
     if (!_mutex) _mutex = xSemaphoreCreateMutex();
+    if (!_sendMutex) _sendMutex = xSemaphoreCreateMutex();
     _txBuf.reserve(4096);
 
-
-    // add wifi re-try
     WiFi.persistent(false);
     WiFi.mode(_apSsid ? WIFI_AP_STA : WIFI_STA);
     WiFi.setHostname(_hostname.c_str());      // after mode(): the STA interface exists now
@@ -39,7 +38,7 @@ void WebTransport::begin() {
             break;
         }
         if (millis() - lastTry >= 10000) {     // retry: first attempt after a flash often fails
-            Serial.print("\n[Web] retrying");
+            Serial.printf("\n[Web] retrying (status %d)", WiFi.status());
             WiFi.disconnect();
             delay(100);
             WiFi.begin(_ssid, _password);
@@ -47,23 +46,7 @@ void WebTransport::begin() {
         }
         delay(500); Serial.print(".");
     }
-    //
-    /*
-    WiFi.mode(_apSsid ? WIFI_AP_STA : WIFI_STA);
-    WiFi.setHostname(_hostname.c_str());
-    WiFi.begin(_ssid, _password);
-    Serial.print("[Web] Connecting");
-    uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED) {
-        if (_apSsid && millis() - t0 >= _staTimeoutMs) {
-            Serial.println("\n[Web] STA timeout - starting SoftAP");
-            WiFi.disconnect(true);
-            startSoftAP();
-            break;
-        }
-        delay(500); Serial.print(".");
-    }
-    */
+    Serial.println("\n[Web] WiFi up");
     WiFi.setSleep(_powerSave);
     if (MDNS.begin(_hostname.c_str())) MDNS.addService("http", "tcp", _port);
     startServer();
@@ -130,12 +113,15 @@ void WebTransport::send(const uint8_t *data, uint16_t len) {
 }
 
 void WebTransport::drain() {
-    if (!_connected) return;
+    if (!_connected || !_sendMutex) return;
+    if (!xSemaphoreTake(_sendMutex, pdMS_TO_TICKS(20))) return;   // another thread is draining
     AsyncWebSocketClient *c = _ws.client(_clientId);
-    if (!c || !c->canSend()) return;                         // keep buffering until the socket can take it
-    std::vector<uint8_t> out;
-    if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(5))) { out.swap(_txBuf); xSemaphoreGive(_mutex); }
-    if (!out.empty()) c->binary(out.data(), out.size());
+    if (c && c->canSend()) {                                     // else keep buffering
+        std::vector<uint8_t> out;
+        if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(5))) { out.swap(_txBuf); xSemaphoreGive(_mutex); }
+        if (!out.empty()) c->binary(out.data(), out.size());
+    }
+    xSemaphoreGive(_sendMutex);
 }
 
 void WebTransport::flush() { drain(); }
