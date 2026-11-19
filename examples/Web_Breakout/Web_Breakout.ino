@@ -375,6 +375,11 @@ int checkCornerCollision(game_type* g, game_state_type* s, uint16_t x, uint16_t 
     if (y > (uint16_t)s->walltop && y < (uint16_t)s->wallbottom) {
         int yRow = (y - s->walltop) / s->brickheight;
         int xCol = x / s->brickwidth;
+        if (xCol > 7) {
+          Serial.println("Error: hit xCol =8");
+          xCol=7;
+        } // jpl this could create out of bounds array access.   array is 0..7
+
         if (isBrickIn(s->wallState, xCol, yRow)) { hitBrick(s, xCol, yRow); return 1; }
     }
     return 0;

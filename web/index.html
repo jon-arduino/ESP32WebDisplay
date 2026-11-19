@@ -37,7 +37,8 @@
     ?port=<n>  ?path=/ws
     ?flush=<ms>         idle auto-present delay when no FLUSH arrives (default 50)
     ?buttons=0          hide the default T1/T2 buttons until the sketch adds some
-    ?debug              show live stats
+    ?debug              show live stats (footer line under the display)
+    R key               download the last ~4 MB of received display data (for bug reports)
 -->
 <html lang="en">
 <head>
@@ -162,7 +163,7 @@ const OP = {
   PIXEL: 0x10, LINE: 0x11, HLINE: 0x12, VLINE: 0x13,
   RECT: 0x20, FILL_RECT: 0x21, ROUNDRECT: 0x22, FILL_ROUNDRECT: 0x23,
   CIRCLE: 0x30, FILL_CIRCLE: 0x31, TRI: 0x32, FILL_TRI: 0x33,
-  BITMAP: 0x40, BITMAP_BG: 0x41,
+  BITMAP: 0x40, BITMAP_BG: 0x41, BITMAP_FG: 0x42, RGB_BITMAP: 0x43, RGB_BITMAP_MASK: 0x44, GRAY_BITMAP: 0x45,
   CURSOR: 0x50, TEXT_COLOR: 0x51, TEXT_COLOR_BG: 0x52, TEXT_SIZE: 0x53, TEXT_WRAP: 0x54,
   CP437: 0x55, FONT: 0x56, WRITE_CHAR: 0x57, WRITE_UTF8: 0x58,
   TOUCH_BEGIN: 0x70, TOUCH_END: 0x71, TOUCH_DELAY: 0x72, PING: 0xF0
@@ -358,9 +359,44 @@ class Renderer {
       case OP.TRI: if (need(14)) this.drawTriangle(i16(p, 0), i16(p, 2), i16(p, 4), i16(p, 6), i16(p, 8), i16(p, 10), u16(p, 12)); break;
       case OP.FILL_TRI: if (need(14)) this.fillTriangle(i16(p, 0), i16(p, 2), i16(p, 4), i16(p, 6), i16(p, 8), i16(p, 10), u16(p, 12)); break;
 
-      // NOTE: the wire format has no colour for DRAW_BITMAP, so the current text colour is used.
+      // NOTE: 0x40 has no colour on the wire, so the current text colour is used (use 0x42 for an explicit colour).
       case OP.BITMAP: if (need(8)) this.drawBitmap(i16(p, 0), i16(p, 2), i16(p, 4), i16(p, 6), p.subarray(8), this.fg, -1); break;
       case OP.BITMAP_BG: if (need(12)) this.drawBitmap(i16(p, 0), i16(p, 2), i16(p, 4), i16(p, 6), p.subarray(12), u16(p, 8), u16(p, 10)); break;
+
+      // Bitmap opcodes 0x42-0x45: header is x,y,w,h (i16 each); the payload must be complete or the frame is rejected.
+      //   0x42  u16 colour, then 1-bit data (rows padded to whole bytes, MSB first)
+      //   0x43  w*h RGB565 pixels (u16 LE, row-major)
+      //   0x44  1-bit mask (same layout as 0x42 data; 1 = draw), then w*h RGB565 pixels
+      //   0x45  w*h 8-bit gray pixels, shown as a true gray ramp
+      case OP.BITMAP_FG: {
+        if (!need(10)) break;
+        const w = i16(p, 4), h = i16(p, 6);
+        if (w < 1 || h < 1 || !need(10 + ((w + 7) >> 3) * h)) { if (w < 1 || h < 1) this.stats.bad++; break; }
+        this.drawBitmap(i16(p, 0), i16(p, 2), w, h, p.subarray(10), u16(p, 8), -1);
+        break;
+      }
+      case OP.RGB_BITMAP: {
+        if (!need(8)) break;
+        const w = i16(p, 4), h = i16(p, 6);
+        if (w < 1 || h < 1) { this.stats.bad++; break; }
+        if (need(8 + 2 * w * h)) this.drawRGB(i16(p, 0), i16(p, 2), w, h, p, 8, -1);
+        break;
+      }
+      case OP.RGB_BITMAP_MASK: {
+        if (!need(8)) break;
+        const w = i16(p, 4), h = i16(p, 6);
+        if (w < 1 || h < 1) { this.stats.bad++; break; }
+        const mb = ((w + 7) >> 3) * h;
+        if (need(8 + mb + 2 * w * h)) this.drawRGB(i16(p, 0), i16(p, 2), w, h, p, 8 + mb, 8);
+        break;
+      }
+      case OP.GRAY_BITMAP: {
+        if (!need(8)) break;
+        const w = i16(p, 4), h = i16(p, 6);
+        if (w < 1 || h < 1) { this.stats.bad++; break; }
+        if (need(8 + w * h)) this.drawGray(i16(p, 0), i16(p, 2), w, h, p, 8);
+        break;
+      }
 
       case OP.CURSOR: if (need(4)) { this.cx = i16(p, 0); this.cy = i16(p, 2); } break;
       case OP.TEXT_COLOR: if (need(2)) this.fg = this.bg = u16(p, 0); break;     // Adafruit: setTextColor(c) sets both
@@ -556,6 +592,32 @@ class Renderer {
     }
   }
 
+  // RGB565 bitmap (Adafruit drawRGBBitmap). Pixels start at p[off]; if maskOff >= 0 a 1-bit mask starts there
+  // (rows padded, MSB first, 1 = draw), like drawRGBBitmap(x, y, bitmap, mask, w, h).
+  drawRGB(x, y, w, h, p, off, maskOff) {
+    const bw = (w + 7) >> 3;
+    for (let j = 0; j < h; j++) {
+      let m = 0;
+      for (let i = 0; i < w; i++) {
+        if (maskOff >= 0) {
+          if (i & 7) m <<= 1; else m = p[maskOff + j * bw + (i >> 3)];
+          if (!(m & 0x80)) continue;
+        }
+        const k = off + 2 * (j * w + i);
+        this.px(x + i, y + j, p[k] | (p[k + 1] << 8));
+      }
+    }
+  }
+  // 8-bit gray bitmap -> RGB565 gray ramp ((g&0xF8)<<8 | (g&0xFC)<<3 | g>>3). A deliberate deviation from Adafruit,
+  // whose drawGrayscaleBitmap uses the 8-bit value itself as the colour (only right for grayscale panels).
+  drawGray(x, y, w, h, p, off) {
+    for (let j = 0; j < h; j++)
+      for (let i = 0; i < w; i++) {
+        const g = p[off + j * w + i];
+        this.px(x + i, y + j, ((g & 0xF8) << 8) | ((g & 0xFC) << 3) | (g >> 3));
+      }
+  }
+
   // 1-bit bitmap, rows padded to whole bytes, MSB first (Adafruit drawBitmap). bg < 0 = transparent.
   drawBitmap(x, y, w, h, data, color, bg) {
     const bw = (w + 7) >> 3;
@@ -692,6 +754,14 @@ const renderer = new Renderer({
   ping() { send(makeFrame(BC.PONG)); }
 });
 const parser = new FrameParser((cmd, p) => renderer.exec(cmd, p));
+const REC_MAX = 4 * 1024 * 1024, recChunks = []; let recBytes = 0;
+function saveCapture() {                                             // press R: download the most recent received bytes
+  if (!recBytes) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob(recChunks, { type: 'application/octet-stream' }));
+  a.download = 'display-capture-' + Date.now() + '.bin';
+  document.body.appendChild(a); a.click(); a.remove();
+}
 
 // ---- WebSocket ------------------------------------------------------------------
 let ws = null, retryMs = 500, retryTimer = 0;
@@ -746,7 +816,10 @@ function connect() {
   };
   ws.onmessage = (ev) => {
     if (typeof ev.data === 'string') return;
-    parser.feed(new Uint8Array(ev.data));
+    const chunk = new Uint8Array(ev.data);
+    recChunks.push(chunk); recBytes += chunk.length;                 // keep the last ~4 MB for the R-key capture
+    while (recBytes > REC_MAX && recChunks.length > 1) recBytes -= recChunks.shift().length;
+    parser.feed(chunk);
     if (renderer.dirty) {                                        // no FLUSH yet: auto-present after an idle gap
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => { renderer.snapshot(); schedulePresent(); }, cfg.flushIdleMs);
@@ -819,6 +892,7 @@ canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 document.addEventListener('keydown', (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
   if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+  if (e.key === 'r' || e.key === 'R') { saveCapture(); return; }
   const key = e.key === '1' ? 0xF2 : e.key === '2' ? 0xF3 : 0;
   if (key && buttons[key] != null) send(makeFrame(key));
 });
@@ -831,7 +905,7 @@ setInterval(() => {
   if (cfg.debug) {
     const st = parser.stats;
     s += ' · ' + ((frames - lastFrames) / dt).toFixed(0) + ' fps · ' + ((st.bytes - lastBytes) / dt / 1024).toFixed(1) +
-         ' KB/s · cmds ' + st.frames + ' · sync ' + st.syncErrors + ' bad ' + (st.invalid + renderer.stats.bad) +
+         ' KB/s · rx ' + st.bytes + ' B · cmds ' + st.frames + ' · sync ' + st.syncErrors + ' bad ' + (st.invalid + renderer.stats.bad) +
          ' unknown ' + renderer.stats.unknown;
   }
   $('info').textContent = s;
